@@ -3,7 +3,7 @@
   "upstream": {
     "owner": "RavelloH",
     "repo": "InsightFlare",
-    "branch": "main"
+    "branch": "main",
     "syncTarget": {
       "type": "branch"
     }
