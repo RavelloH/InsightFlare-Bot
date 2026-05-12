@@ -2,8 +2,16 @@
   "$schema": "./sync-bot.config.schema.json",
   "upstream": {
     "owner": "RavelloH",
+<<<<<<< ours
     "repo": "InsightFlare",
     "branch": "main"
+=======
+    "repo": "upstream-sync-bot",
+    "branch": "main",
+    "syncTarget": {
+      "type": "branch"
+    }
+>>>>>>> theirs
   },
   "downstream": {
     "syncBranch": "chore/sync-upstream",
