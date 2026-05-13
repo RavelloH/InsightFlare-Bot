@@ -53,7 +53,6 @@ runs:
         SYNC_TARGET_TYPE=$(jq -r '.upstream.syncTarget.type // "branch"' "$CONFIG")
         SYNC_TARGET_MAJOR=$(jq -r '.upstream.syncTarget.major // ""' "$CONFIG")
         SYNC_BRANCH=$(jq -r '.downstream.syncBranch' "$CONFIG")
-        BASE_TAG=$(jq -r '.downstream.baseTag' "$CONFIG")
         PR_TITLE=$(jq -r '.downstream.prTitle' "$CONFIG")
         TREE_SCAN_EXCLUDE=$(jq -r '.downstream.treeScanExclude | map(":!" + .) | join(" ")' "$CONFIG")
 
@@ -71,7 +70,6 @@ runs:
           echo "SYNC_TARGET_TYPE=$SYNC_TARGET_TYPE"
           echo "SYNC_TARGET_MAJOR=$SYNC_TARGET_MAJOR"
           echo "SYNC_BRANCH=$SYNC_BRANCH"
-          echo "BASE_TAG=$BASE_TAG"
           echo "PR_TITLE=$PR_TITLE"
           echo "TREE_SCAN_EXCLUDE=$TREE_SCAN_EXCLUDE"
         } >> "$GITHUB_ENV"
@@ -114,9 +112,6 @@ runs:
         if [ "${SYNC_TARGET_TYPE}" = "latestTag" ] || [ "${SYNC_TARGET_TYPE}" = "latestMajorTag" ]; then
           git fetch upstream "refs/tags/*:refs/tags/*" --no-recurse-submodules
         fi
-        # Fetch the base-tracking tag if it exists from a previous run.
-        # 2>/dev/null hides "no such ref" on first sync of a new target.
-        git fetch origin "refs/tags/${BASE_TAG}:refs/tags/${BASE_TAG}" 2>/dev/null || true
 
     - name: Resolve upstream sync target
       shell: bash
@@ -158,42 +153,40 @@ runs:
         #     by cloudflare[bot], no shared history with upstream.
         #
         # Mode is chosen by whether `git merge-base` finds shared history:
-        #   * yes  -> mode=merge: regular `git merge --no-ff`, preserves
-        #              upstream commit history in the user's repo.
-        #   * no   -> mode=squash: tree-match to recover the virtual base,
-        #              apply diff as a single squash commit via
-        #              `git apply --3way`. Avoids dumping all of upstream's
-        #              history into a snapshot-clone repository.
+        #   * yes -> mode=merge: regular `git merge --no-ff`, preserves
+        #            upstream commit history in the user's repo.
+        #   * no  -> mode=adopt-history: rebuild the sync branch on top of
+        #            upstream history, then re-apply downstream customizations
+        #            as a single commit. After that PR is merged, future runs
+        #            naturally use merge mode.
 
         MERGE_BASE="$(git merge-base "origin/${DEFAULT_BRANCH}" "${SYNC_TARGET_SHA}" 2>/dev/null || true)"
 
         if [ -n "${MERGE_BASE}" ]; then
           MODE=merge
           BASE_SHA="${MERGE_BASE}"
-          RESOLVED_FROM=merge-base
           echo "Shared git history detected (merge-base ${BASE_SHA:0:7}). Using MERGE mode."
         else
-          MODE=squash
-          if git rev-parse --verify --quiet "refs/tags/${BASE_TAG}^{commit}" > /dev/null; then
-            BASE_SHA="$(git rev-parse "refs/tags/${BASE_TAG}^{commit}")"
-            RESOLVED_FROM=tag
-            echo "Snapshot clone detected. Using SQUASH mode with base from \`${BASE_TAG}\` tag (${BASE_SHA:0:7})."
-          else
-            echo "Snapshot clone detected and no \`${BASE_TAG}\` tag. Scanning upstream for a matching tree..."
-            BASE_SHA=""
-            for sha in $(git rev-list "${SYNC_TARGET_SHA}" --max-count=1000); do
-              # shellcheck disable=SC2086
-              if git diff --quiet HEAD "$sha" -- . ${TREE_SCAN_EXCLUDE}; then
-                BASE_SHA="$sha"
-                break
-              fi
-            done
-            if [ -z "${BASE_SHA}" ]; then
-              echo "::error::Could not auto-resolve the upstream base commit. The local HEAD tree did not match any of the last 1000 upstream commits. Please create a tag manually: \`git tag ${BASE_TAG} <upstream-sha-at-deploy-time> && git push origin ${BASE_TAG}\`."
-              exit 1
+          MODE=adopt-history
+          echo "Snapshot clone detected. Scanning upstream for the best matching tree..."
+          BASE_SHA=""
+          # In adopt-history mode, sync-bot.config.json is normally
+          # instance-local. Ignore it while
+          # searching for the upstream commit represented by the downstream
+          # tree.
+          for sha in $(git rev-list "${SYNC_TARGET_SHA}" --max-count=1000); do
+            # shellcheck disable=SC2086
+            if git diff --quiet HEAD "$sha" -- . ${TREE_SCAN_EXCLUDE} ':!sync-bot.config.json'; then
+              BASE_SHA="$sha"
+              break
             fi
-            RESOLVED_FROM=scan
-            echo "Tree-match found upstream commit ${BASE_SHA:0:7}. Using SQUASH mode."
+          done
+
+          if [ -n "${BASE_SHA}" ]; then
+            echo "Tree-match found upstream commit ${BASE_SHA:0:7}. Using ADOPT-HISTORY mode."
+          else
+            echo "::error::Could not auto-resolve the upstream base commit. The local HEAD tree did not match any of the last 1000 upstream commits."
+            exit 1
           fi
         fi
 
@@ -201,7 +194,6 @@ runs:
           echo "mode=${MODE}"
           echo "base_sha=${BASE_SHA}"
           echo "base_short=${BASE_SHA:0:7}"
-          echo "resolved_from=${RESOLVED_FROM}"
           echo "default_branch=${DEFAULT_BRANCH}"
         } >> "$GITHUB_OUTPUT"
 
@@ -217,7 +209,7 @@ runs:
 
         echo "default_branch=${DEFAULT_BRANCH}" >> "$GITHUB_OUTPUT"
 
-        if [ "$BASE_SHA" = "$HEAD_SHA" ]; then
+        if [ "$BASE_SHA" = "$HEAD_SHA" ] && [ "$MODE" != "adopt-history" ]; then
           echo "Upstream is already at the synced base (${BASE_SHA:0:7}). Nothing to do."
           echo "has_changes=false" >> "$GITHUB_OUTPUT"
           exit 0
@@ -256,13 +248,6 @@ runs:
 
         HAS_CONFLICTS=false
         CONFLICT_FILES=""
-        MANUAL_WORKFLOW_FILES="$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" -- '.github/workflows/**' || true)"
-        if [ -n "${MANUAL_WORKFLOW_FILES}" ]; then
-          echo "Workflow file changes detected. They will be excluded from the bot commit because this App does not request workflows permission."
-          printf '%s\n' "${MANUAL_WORKFLOW_FILES}" > /tmp/manual-workflow-files.txt
-        else
-          : > /tmp/manual-workflow-files.txt
-        fi
 
         if [ "${MODE}" = "merge" ]; then
           # Fork / clean clone — preserve upstream commit history via
@@ -283,97 +268,68 @@ runs:
         Resolve the <<<<<<< markers manually before merging this PR."
           fi
 
-          if [ -n "${MANUAL_WORKFLOW_FILES}" ]; then
-            while IFS= read -r f; do
-              [ -z "$f" ] && continue
-              git checkout "origin/${DEFAULT_BRANCH}" -- "$f" 2>/dev/null || git rm -f --ignore-unmatch "$f"
-            done < /tmp/manual-workflow-files.txt
-            git add -A -- .github/workflows
-            git commit --amend --no-edit --allow-empty
-          fi
         else
-          # Snapshot clone — no shared history. Apply BASE..HEAD as a
-          # single squash commit using `git apply --3way`. Avoids pulling
-          # the entire upstream history into a one-commit repo.
-          PATCH_FILE="$(mktemp)"
-          git diff --binary "${BASE_SHA}" "${HEAD_SHA}" -- . ':(exclude).github/workflows/**' > "${PATCH_FILE}"
+          # Snapshot clone — no shared history. Create a merge commit whose
+          # first parent is the downstream default branch and second parent is
+          # the upstream target. GitHub can open this PR because it shares
+          # history with the base branch; after merge, the repo also contains
+          # upstream history and future syncs use MERGE mode.
+          git merge -s ours --allow-unrelated-histories --no-commit "${HEAD_SHA}"
 
-          if [ ! -s "${PATCH_FILE}" ] && [ ! -s /tmp/manual-workflow-files.txt ]; then
-            echo "Empty patch produced. Treating as no-op."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "has_conflicts=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          # Start the merge result from the upstream target tree, then overlay
+          # only downstream paths that differ from the resolved upstream base.
+          # This keeps real downstream customizations without preserving stale
+          # template files that should be updated from upstream.
+          git read-tree --reset -u "${HEAD_SHA}"
 
-          if [ -s "${PATCH_FILE}" ]; then
-            APPLY_LOG="$(mktemp)"
-            APPLY_RC=0
-            git apply --3way --whitespace=nowarn "${PATCH_FILE}" > "${APPLY_LOG}" 2>&1 || APPLY_RC=$?
+          git diff --name-status -z "${BASE_SHA}" "origin/${DEFAULT_BRANCH}" -- . \
+            > /tmp/downstream-customizations.z
+          node -e '
+            const fs = require("fs");
+            const data = fs.readFileSync("/tmp/downstream-customizations.z", "utf8").split("\0").filter(Boolean);
+            const paths = [];
+            for (let i = 0; i < data.length; i += 1) {
+              const status = data[i];
+              if (/^[RC]/.test(status)) {
+                paths.push(data[i + 1], data[i + 2]);
+                i += 2;
+              } else {
+                paths.push(data[i + 1]);
+                i += 1;
+              }
+            }
+            for (const p of [...new Set(paths)].filter(Boolean)) console.log(p);
+          ' > /tmp/downstream-customization-paths.txt
 
-            CONFLICT_FILES="$(git grep -l -E '^<<<<<<< ' -- . 2>/dev/null || true)"
-
-            if [ "${APPLY_RC}" != "0" ] && [ -z "${CONFLICT_FILES}" ]; then
-              echo "git apply --3way could not fully apply the patch without conflict markers. Retrying with --reject so the PR can carry manual-resolution hints."
-              git reset --hard "origin/${DEFAULT_BRANCH}"
-              REJECT_LOG="$(mktemp)"
-              REJECT_RC=0
-              git apply --reject --whitespace=nowarn "${PATCH_FILE}" > "${REJECT_LOG}" 2>&1 || REJECT_RC=$?
-
-              mkdir -p .upstream-sync
-              {
-                echo "# Upstream sync patch could not be fully applied"
-                echo ""
-                echo "The bot could not apply every hunk automatically. Files ending in \`.rej\` contain rejected hunks that must be merged manually before this PR is merged."
-                echo ""
-                echo "## git apply --3way output"
-                echo ""
-                echo '```text'
-                cat "${APPLY_LOG}"
-                echo '```'
-                echo ""
-                echo "## git apply --reject output"
-                echo ""
-                echo '```text'
-                cat "${REJECT_LOG}"
-                echo '```'
-              } > .upstream-sync/apply-failure.md
-
-              REJECT_FILES="$(find . -name '*.rej' -print | sed 's#^\./##' | sort || true)"
-              if [ -n "${REJECT_FILES}" ]; then
-                CONFLICT_FILES="${REJECT_FILES}"
-              else
-                CONFLICT_FILES=".upstream-sync/apply-failure.md"
-              fi
-              HAS_CONFLICTS=true
-
-              if [ "${REJECT_RC}" != "0" ]; then
-                echo "git apply --reject exited ${REJECT_RC}; preserving logs in .upstream-sync/apply-failure.md."
-              fi
-            elif [ -n "${CONFLICT_FILES}" ]; then
-              HAS_CONFLICTS=true
-            fi
-          else
-            echo "Only workflow files changed upstream. Creating an empty sync commit so the PR can carry manual-copy instructions."
-          fi
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            git checkout "origin/${DEFAULT_BRANCH}" -- "$f" 2>/dev/null || git rm -f --ignore-unmatch "$f"
+          done < /tmp/downstream-customization-paths.txt
 
           git add -A
 
-          SQUASH_BODY="Squashes ${COUNT} upstream commit(s) from ${BASE_SHA:0:7}..${HEAD_SHORT}.
+          ADOPT_TITLE="chore: adopt upstream history at ${UPSTREAM_REPO}@${HEAD_SHORT}"
+          ADOPT_BODY="Rebuilds this snapshot-clone sync branch on top of upstream history at ${HEAD_SHORT}.
+
+        Preserves downstream customizations from origin/${DEFAULT_BRANCH} relative to upstream base ${BASE_SHA:0:7}.
 
         Auto-applied by sync-upstream bot (run #${RUN_ID})."
 
           if [ "${HAS_CONFLICTS}" = "true" ]; then
-            SQUASH_TITLE="chore: sync upstream ${UPSTREAM_REPO}@${HEAD_SHORT} (with conflicts)"
-            SQUASH_BODY="${SQUASH_BODY}
+            git commit --allow-empty -m "${ADOPT_TITLE} (with conflicts)" -m "${ADOPT_BODY}
 
         ⚠️ Manual resolution required in: $(echo "${CONFLICT_FILES}" | tr '\n' ' ')
 
-        Resolve conflict markers and/or apply rejected hunks from any .rej files before merging this PR."
+        Resolve conflict markers before merging this PR."
           else
-            SQUASH_TITLE="chore: sync upstream ${UPSTREAM_REPO}@${HEAD_SHORT}"
-          fi
+            if git diff --cached --quiet; then
+              git commit --allow-empty -m "${ADOPT_TITLE}" -m "${ADOPT_BODY}
 
-          git commit --allow-empty -m "${SQUASH_TITLE}" -m "${SQUASH_BODY}"
+        No downstream customizations needed to be reapplied."
+            else
+              git commit -m "${ADOPT_TITLE}" -m "${ADOPT_BODY}"
+            fi
+          fi
         fi
 
         # Persist conflict list for the PR body step.
@@ -451,7 +407,6 @@ runs:
       run: |
         BASE='${{ steps.base.outputs.base_sha }}'
         BASE_SHORT='${{ steps.base.outputs.base_short }}'
-        BASE_RESOLVED_FROM='${{ steps.base.outputs.resolved_from }}'
         MODE='${{ steps.base.outputs.mode }}'
         HEAD='${{ steps.range.outputs.head_sha }}'
         HEAD_SHORT='${{ steps.range.outputs.head_short }}'
@@ -464,19 +419,18 @@ runs:
         WORKFLOW_URL="${BOT_SERVER_URL}/${BOT_REPOSITORY}/blob/HEAD/.github/workflows/sync-fanout.yml"
 
         TOTAL_COMMITS="$(git rev-list --count --no-merges "${BASE}..${HEAD}")"
-        TOTAL_FILES="$(git diff --name-only "${BASE}..${HEAD}" -- . ':(exclude).github/workflows/**' | wc -l | tr -d ' ')"
+        TOTAL_FILES="$(git diff --name-only "${BASE}..${HEAD}" | wc -l | tr -d ' ')"
 
-        case "${BASE_RESOLVED_FROM}" in
-          merge-base) BASE_NOTE="via shared git history (\`git merge-base\`)" ;;
-          tag)        BASE_NOTE="from \`${BASE_TAG}\` tag (set by a previous sync)" ;;
-          scan)       BASE_NOTE="auto-detected via tree match" ;;
-          *)          BASE_NOTE="" ;;
-        esac
+        if [ "${MODE}" = "merge" ]; then
+          BASE_NOTE="via shared git history (\`git merge-base\`)"
+        else
+          BASE_NOTE="auto-detected via tree match"
+        fi
 
         if [ "${MODE}" = "merge" ]; then
           MODE_NOTE="This repository has shared git history with the upstream (fork or clean clone), so the changes are applied as a regular **merge commit** — upstream commit history and authorship are preserved."
         else
-          MODE_NOTE="This repository has no shared git history with the upstream (e.g., created via Cloudflare's *Deploy to Cloudflare* button, which produces a single snapshot commit). The changes are applied as a single **squashed commit** via \`git apply --3way\` to avoid pulling all of upstream's history into a one-commit repository. Per-commit authorship is preserved below in the *Incoming commits* section."
+          MODE_NOTE="This repository has no shared git history with the upstream (e.g., created via Cloudflare's *Deploy to Cloudflare* button, which produces a single snapshot commit). The sync branch is rebuilt on top of upstream history, then downstream customizations are reapplied as one commit. After this PR is merged, future syncs can use regular merge mode."
         fi
 
         case "${SYNC_TARGET_KIND}" in
@@ -504,22 +458,10 @@ runs:
           echo "> ℹ️ ${MODE_NOTE}"
           echo ""
 
-          if [ -s /tmp/manual-workflow-files.txt ]; then
-            echo "## ⚠️ Workflow files require manual copy"
-            echo ""
-            echo "The upstream changed GitHub Actions workflow files. This bot intentionally does not request the \`workflows\` permission, so those files are excluded from the pushed sync branch. Review and copy these files manually from upstream if you want the workflow changes:"
-            echo ""
-            while IFS= read -r f; do
-              [ -z "$f" ] && continue
-              echo "- [\`${f}\`](https://github.com/${UPSTREAM_REPO}/blob/${HEAD}/${f})"
-            done < /tmp/manual-workflow-files.txt
-            echo ""
-          fi
-
           if [ "${HAS_CONFLICTS}" = "true" ]; then
             echo "## ⚠️ Conflicts detected"
             echo ""
-            echo "Some files could not be merged automatically. The following files contain conflict markers, rejected patch hunks, or apply-failure details and **must be resolved before merging**:"
+            echo "Some downstream customizations could not be reapplied automatically. The following files contain conflict markers and **must be resolved before merging**:"
             echo ""
             while IFS= read -r f; do
               [ -z "$f" ] && continue
@@ -531,7 +473,7 @@ runs:
             echo "\`\`\`bash"
             echo "git fetch origin ${SYNC_BRANCH}"
             echo "git checkout ${SYNC_BRANCH}"
-            echo "# edit the files above, remove conflict markers, and apply any *.rej hunks"
+            echo "# edit the files above and remove conflict markers"
             echo "git add -A && git commit --amend --no-edit"
             echo "git push --force-with-lease"
             echo "\`\`\`"
@@ -592,7 +534,7 @@ runs:
           echo ""
           echo "## Files changed"
           echo ""
-          git diff --name-status "${BASE}..${HEAD}" -- . ':(exclude).github/workflows/**' | head -30 | awk -v repo="${UPSTREAM_REPO}" '{
+          git diff --name-status "${BASE}..${HEAD}" | head -30 | awk -v repo="${UPSTREAM_REPO}" '{
             status = $1;
             path = $2;
             label = "changed";
@@ -644,9 +586,12 @@ runs:
         # cheaper than debugging a stray "could not find repo" later.
         REPO_FLAG="--repo ${TARGET_OWNER}/${TARGET_REPO}"
 
+        # Only reuse an open PR. Closed or merged sync PRs may not be
+        # reopenable after the branch is force-updated, so the next sync
+        # should create a fresh PR instead of failing on `gh pr reopen`.
         # shellcheck disable=SC2086
-        PR_DATA="$(gh pr list $REPO_FLAG --head "${SYNC_BRANCH}" --state all --json number,state)"
-        PR_NUMBER="$(echo "${PR_DATA}" | jq -r '[.[] | select(.state == "OPEN" or .state == "CLOSED")] | .[0].number // ""')"
+        PR_DATA="$(gh pr list $REPO_FLAG --head "${SYNC_BRANCH}" --state open --json number,state)"
+        PR_NUMBER="$(echo "${PR_DATA}" | jq -r '.[0].number // ""')"
 
         if [ -z "${PR_NUMBER}" ]; then
           # shellcheck disable=SC2086
@@ -657,12 +602,6 @@ runs:
             --body-file /tmp/pr_body.md
           echo "Created new sync PR in ${TARGET_OWNER}/${TARGET_REPO}."
         else
-          PR_STATE="$(echo "${PR_DATA}" | jq -r --argjson n "${PR_NUMBER}" '[.[] | select(.number == $n)] | .[0].state // ""')"
-          if [ "${PR_STATE}" = "CLOSED" ]; then
-            # shellcheck disable=SC2086
-            gh pr reopen $REPO_FLAG "${PR_NUMBER}"
-            echo "Reopened PR #${PR_NUMBER} in ${TARGET_OWNER}/${TARGET_REPO}."
-          fi
           # shellcheck disable=SC2086
           gh pr edit $REPO_FLAG "${PR_NUMBER}" \
             --title "${PR_TITLE}" \
@@ -670,28 +609,3 @@ runs:
           echo "Updated PR #${PR_NUMBER} in ${TARGET_OWNER}/${TARGET_REPO}."
         fi
 
-    - name: Update upstream-sync-base tag
-      if: steps.range.outputs.has_changes == 'true' && steps.prepare.outputs.skip != 'true' && steps.prepare.outputs.has_conflicts != 'true'
-      shell: bash
-      working-directory: target
-      run: |
-        # Move the tag only after a cleanly-applied sync. If the PR contains
-        # conflict markers or rejected hunks, the target repo has not actually
-        # accepted the upstream tree yet; advancing the cursor would make the
-        # next run diff from the wrong base.
-        HEAD_SHA='${{ steps.range.outputs.head_sha }}'
-        git tag -f "${BASE_TAG}" "${HEAD_SHA}"
-        git push origin --force "refs/tags/${BASE_TAG}"
-        echo "Tagged ${BASE_TAG} → ${HEAD_SHA:0:7}."
-
-    - name: Seed upstream-sync-base tag (no upstream changes)
-      if: steps.range.outputs.has_changes == 'false' && steps.base.outputs.resolved_from == 'scan'
-      shell: bash
-      working-directory: target
-      run: |
-        # First run that found nothing new to sync, but resolved the base via
-        # tree scan. Persist the tag so we never scan again.
-        BASE_SHA='${{ steps.base.outputs.base_sha }}'
-        git tag -f "${BASE_TAG}" "${BASE_SHA}"
-        git push origin --force "refs/tags/${BASE_TAG}"
-        echo "Seeded ${BASE_TAG} → ${BASE_SHA:0:7} (no upstream changes this run)."
