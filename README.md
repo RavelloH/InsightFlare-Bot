@@ -30,10 +30,9 @@ This repository is meant to be copied once per upstream project by the upstream 
 │  │     scoped to ONE target repo                │  │
 │  │   uses: ./.github/actions/sync-one           │  │
 │  │     - git clone target                       │  │
-│  │     - detect mode (merge / squash)           │  │
+│  │     - detect mode (merge / adopt-history)    │  │
 │  │     - apply changes                          │  │
 │  │     - open or update PR                      │  │
-│  │     - move `upstream-sync-base` tag          │  │
 │  └──────────────────────────────────────────────┘  │
 └────────────────────────────────────────────────────┘
                   │ App installation token (1h, scoped)
@@ -45,7 +44,7 @@ This repository is meant to be copied once per upstream project by the upstream 
         └─────────────────────┘
 ```
 
-The bot stores **no state**. Every run re-queries GitHub for the live installation list, and each target repo carries its own `upstream-sync-base` tag and `chore/sync-upstream` branch as the cursor.
+The bot stores **no state**. Every run re-queries GitHub for the live installation list. Repositories with shared history use `git merge-base`; snapshot clones use a tree scan to find the upstream version represented by the current downstream tree before adopting upstream history.
 
 ---
 
@@ -72,6 +71,7 @@ Go to <https://github.com/settings/apps/new> (or your org's `/organizations/<org
 | Webhook → Active | **Unchecked** (we don't need webhooks; cron + dispatch is enough) |
 | Repository permissions → Contents | **Read and write** |
 | Repository permissions → Pull requests | **Read and write** |
+| Repository permissions → Workflows | **Read and write** |
 | Repository permissions → Metadata | **Read-only** (auto-included) |
 | Where can this app be installed | **Any account** (so downstream users can install it) |
 
@@ -109,7 +109,6 @@ Edit [`sync-bot.config.json`](./sync-bot.config.json):
   },
   "downstream": {
     "syncBranch": "chore/sync-upstream",
-    "baseTag": "upstream-sync-base",
     "prTitle": "chore: sync upstream YourOrg/YourProject",
     "treeScanExclude": ["wrangler.toml"]
   }
@@ -206,14 +205,13 @@ When the bot runs against your repo, it:
 
 1. Decides on a **sync mode** based on whether your repo shares git history with upstream:
    - **`merge` mode** — fork or clean clone. The bot opens a PR with a real merge commit, preserving upstream commit history.
-   - **`squash` mode** — snapshot clone (no shared history, e.g., Cloudflare "Deploy to" button output). The bot squashes the upstream diff into one commit applied via `git apply --3way`.
+   - **`adopt-history` mode** — snapshot clone (no shared history, e.g., Cloudflare "Deploy to" button output). The bot rebuilds the sync branch on top of upstream history, then reapplies downstream customizations as one commit. After that PR is merged, future syncs can use regular merge mode.
 2. Force-pushes the result to `chore/sync-upstream`.
 3. Creates the PR or, if `chore/sync-upstream` already has a PR (open or closed), updates that PR's title and body in place.
-4. If the sync applied cleanly, tags the upstream commit it synced against as `upstream-sync-base` in your repo, so the next run knows where to pick up. Conflict PRs do not advance this tag because the target repo has not accepted that upstream tree yet.
 
-Conflicts: if `git apply --3way` or `git merge` produce conflict markers, or if a snapshot-clone patch cannot be fully applied and leaves `.rej` files, the bot still pushes the branch and opens the PR. The PR body lists which files need manual resolution. Resolve them on `chore/sync-upstream` and the workflow will pick up the resolved tree on the next run.
+Conflicts: if `git merge` or the adopt-history customization commit produces conflict markers, the bot still pushes the branch and opens the PR. The PR body lists which files need manual resolution. Resolve them on `chore/sync-upstream` and the workflow will pick up the resolved tree on the next run.
 
-Workflow files: changes under `.github/workflows/` are intentionally excluded from the pushed sync branch because updating workflow files requires the GitHub App's `workflows` permission. The bot does not request that permission by default. If upstream changed workflow files, the PR body links to the files and asks you to copy them manually after review.
+Workflow files: changes under `.github/workflows/` are synced like other files. This requires the GitHub App's **Workflows: Read and write** permission.
 
 ---
 
@@ -221,7 +219,7 @@ Workflow files: changes under `.github/workflows/` are intentionally excluded fr
 
 | Path | Purpose |
 | --- | --- |
-| `sync-bot.config.json` | Per-instance config: upstream coordinates + downstream branch / tag names. **Edit this.** |
+| `sync-bot.config.json` | Per-instance config: upstream coordinates + downstream branch / PR settings. **Edit this.** |
 | `.github/workflows/sync-fanout.yml` | The schedule + dispatch trigger, enumerate job, and matrix fan-out. |
 | `.github/actions/sync-one/action.yml` | Composite action with all per-target sync logic (mode detection, patch application, PR body). |
 | `scripts/enumerate-installations.mjs` | Lists installations + repos via `@octokit/auth-app`, filters self/upstream, emits matrix JSON. |
@@ -232,9 +230,10 @@ Workflow files: changes under `.github/workflows/` are intentionally excluded fr
 
 ## Security model
 
-- **Per-target token scoping**: each matrix job mints an installation token via `actions/create-github-app-token@v1` with `repositories:` set to one repo. A leaked token compromises at most one user's repo, not the fleet.
+- **Per-target token scoping**: each matrix job mints an installation token via `actions/create-github-app-token@v1` with `repositories:` set to one repo and explicit `contents`, `pull-requests`, and `workflows` write permissions. A leaked token compromises at most one user's repo, not the fleet.
 - **No webhooks**: the App has webhook disabled. We pull from GitHub on a schedule; we never accept inbound events to a maintained server.
 - **No stored state**: there's no database of "who installed". GitHub is the source of truth; we re-read it every run. Users uninstalling are picked up automatically.
+- **Workflow write access is powerful**: the App can update GitHub Actions workflow files in installed repositories. Only install it on repositories that should receive upstream workflow changes.
 - **The `SYNC_APP_PRIVATE_KEY` secret** is the entire trust anchor. Treat it like a root credential — anyone with the private key can act as the App against every installation. Use repo secrets, not organization-wide, unless you have a reason to broaden.
 
 ---
