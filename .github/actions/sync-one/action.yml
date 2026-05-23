@@ -378,7 +378,7 @@ runs:
         BASE='${{ steps.base.outputs.base_sha }}'
         HEAD='${{ steps.range.outputs.head_sha }}'
 
-        SHAS=$(git log --no-merges --pretty=format:"%H" "${BASE}..${HEAD}" | head -50)
+        SHAS=$(git log --no-merges --pretty=format:"%H" "${BASE}..${HEAD}" | { head -50; cat > /dev/null; })
         RESOLVED=0
         FAILED=0
         for SHA in ${SHAS}; do
@@ -500,7 +500,7 @@ runs:
           echo "## Incoming commits"
           echo ""
           git log --no-merges --pretty=format:"%H%x09%s%x09%an%x09%ae" "${BASE}..${HEAD}" \
-            | head -50 \
+            | { head -50; cat > /dev/null; } \
             | awk -F'\t' -v repo="${UPSTREAM_REPO}" -v authors_file="/tmp/authors.tsv" '
                 BEGIN {
                   while ((getline line < authors_file) > 0) {
@@ -535,7 +535,7 @@ runs:
           echo ""
           echo "## Files changed"
           echo ""
-          git diff --name-status "${BASE}..${HEAD}" | head -30 | awk -v repo="${UPSTREAM_REPO}" '{
+          git diff --name-status "${BASE}..${HEAD}" | { head -30; cat > /dev/null; } | awk -v repo="${UPSTREAM_REPO}" '{
             status = $1;
             path = $2;
             label = "changed";
